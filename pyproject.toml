@@ -1,0 +1,27 @@
+[project]
+name = "gdrive-file-eraser"
+version = "1.0.2"
+description = "A CLI tool to find and delete YOUR large files from Google Drive (excludes shared files for safety)"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "google-api-python-client==2.127.0",
+    "google-auth-httplib2==0.2.0", 
+    "google-auth-oauthlib==1.2.0",
+    "click==8.1.7",
+    "rich==13.7.1",
+    "python-dateutil==2.9.0",
+]
+
+[project.scripts]
+gdrive-eraser = "gdrive_eraser:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."] 
