@@ -51,4 +51,8 @@ Thumbs.db
 
 # Temporary files
 *.tmp
-*.temp 
+*.temp
+
+# Claude Code specific files (keep local)
+.claude/
+CLAUDE.md 

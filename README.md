@@ -3,7 +3,10 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A powerful command-line tool to find and delete large files from your Google Drive. Clean up storage efficiently by targeting files by extension and size. **Safely operates only on files you own** - shared files are excluded for security.
+A powerful command-line tool to find and delete large files from your Google Drive. Clean up storage efficiently by targeting files by extension and size. **Safely operates only on files you own**—shared files are excluded for security.
+
+## Motivation
+For years, deleting large numbers of photos or videos from Google Drive was slow and frustrating—you had to manually select files in a paginated list, making bulk cleanup nearly impossible. This tool was created to solve that problem: it leverages the Google Drive API to quickly find and remove large files you own, streamlining the cleanup process and saving you valuable time.
 
 ## ✨ Features
 
