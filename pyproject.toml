@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "google-api-python-client==2.127.0",
-    "google-auth-httplib2==0.2.0", 
+    "google-auth-httplib2==0.2.0",
     "google-auth-oauthlib==1.2.0",
     "click==8.1.7",
     "rich==13.7.1",

@@ -6,11 +6,12 @@ A CLI tool to find and delete large files from Google Drive by extension and siz
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Dict
 import json
-
 import click
+
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import Confirm
@@ -21,11 +22,67 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError, TransportError
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
 console = Console()
+
+
+def retry_api_call(func, *args, max_retries=3, backoff_factor=1.0, **kwargs):
+    """Retry API calls with exponential backoff for transient errors."""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except HttpError as e:
+            if e.resp.status in [429, 500, 502, 503, 504]:  # Retryable errors
+                if attempt < max_retries - 1:
+                    wait_time = backoff_factor * (2 ** attempt)
+                    console.print(f"[yellow]API rate limit/server error. Retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})[/yellow]")
+                    time.sleep(wait_time)
+                    continue
+            raise
+        except Exception as e:
+            if attempt < max_retries - 1 and "timeout" in str(e).lower():
+                wait_time = backoff_factor * (2 ** attempt)
+                console.print(f"[yellow]Network timeout. Retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})[/yellow]")
+                time.sleep(wait_time)
+                continue
+            raise
+    return None
+
+
+def validate_extension(extension: str) -> str:
+    """Validate and normalize file extension."""
+    if not extension:
+        return extension
+    
+    # Remove leading dot if present
+    extension = extension.lstrip('.')
+    
+    # Basic validation
+    if not extension.replace('_', '').replace('-', '').isalnum():
+        raise ValueError(f"Invalid extension: {extension}. Extensions should contain only letters, numbers, hyphens, and underscores.")
+    
+    if len(extension) > 10:
+        raise ValueError(f"Extension too long: {extension}. Maximum length is 10 characters.")
+    
+    return extension
+
+
+def validate_size(size: float) -> float:
+    """Validate file size parameter."""
+    if size is None:
+        return size
+    
+    if size <= 0:
+        raise ValueError(f"Size must be positive, got: {size}")
+    
+    if size > 1024 * 1024:  # 1TB limit
+        raise ValueError(f"Size too large: {size}MB. Maximum supported size is 1TB (1048576 MB).")
+    
+    return size
 
 
 def authenticate():
@@ -36,13 +93,30 @@ def authenticate():
     
     # Token file stores the user's access and refresh tokens
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        except (ValueError, json.JSONDecodeError) as e:
+            console.print(f"[red]Error: Invalid token.json file: {e}[/red]")
+            console.print("[yellow]Removing corrupted token file and starting fresh authentication...[/yellow]")
+            token_path.unlink(missing_ok=True)
+            creds = None
     
     # If there are no (valid) credentials available, let the user log in
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                console.print(f"[red]Error refreshing credentials: {e}[/red]")
+                console.print("[yellow]Please re-authenticate...[/yellow]")
+                token_path.unlink(missing_ok=True)
+                creds = None
+            except TransportError as e:
+                console.print(f"[red]Network error during authentication: {e}[/red]")
+                console.print("[yellow]Please check your internet connection and try again.[/yellow]")
+                sys.exit(1)
+        
+        if not creds or not creds.valid:
             if not credentials_path.exists():
                 console.print("[red]Error: credentials.json not found![/red]")
                 console.print("\nTo use this tool, you need to:")
@@ -52,21 +126,47 @@ def authenticate():
                 console.print("4. Create OAuth 2.0 credentials")
                 console.print("5. Download the credentials as 'credentials.json'")
                 console.print("6. Place it in the same directory as this script")
+                console.print("\n[bold]Tip:[/bold] Run 'python gdrive_eraser.py setup' for detailed instructions")
                 sys.exit(1)
-                
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(credentials_path), SCOPES)
-            creds = flow.run_local_server(port=0)
+            
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(credentials_path), SCOPES)
+                creds = flow.run_local_server(port=0)
+            except ValueError as e:
+                console.print(f"[red]Error: Invalid credentials.json file: {e}[/red]")
+                console.print("[yellow]Please download a fresh credentials.json from Google Cloud Console.[/yellow]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(f"[red]Error during OAuth flow: {e}[/red]")
+                console.print("[yellow]Please check your credentials.json file and try again.[/yellow]")
+                sys.exit(1)
         
         # Save the credentials for the next run
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
+        try:
+            with open(token_path, 'w') as token:
+                token.write(creds.to_json())
+        except OSError as e:
+            console.print(f"[red]Warning: Could not save token file: {e}[/red]")
+            console.print("[yellow]You may need to re-authenticate next time.[/yellow]")
     
     try:
         service = build('drive', 'v3', credentials=creds)
+        # Test the service with a simple API call
+        service.about().get(fields='user').execute()
         return service
     except HttpError as error:
-        console.print(f"[red]An error occurred: {error}[/red]")
+        if error.resp.status == 403:
+            console.print("[red]Error: Google Drive API access denied.[/red]")
+            console.print("[yellow]Please ensure the Google Drive API is enabled in your Google Cloud Console.[/yellow]")
+        elif error.resp.status == 401:
+            console.print("[red]Error: Authentication failed.[/red]")
+            console.print("[yellow]Please delete token.json and re-authenticate.[/yellow]")
+        else:
+            console.print(f"[red]Google Drive API error: {error}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error during service initialization: {e}[/red]")
         sys.exit(1)
 
 
@@ -79,10 +179,16 @@ def get_folder_path(service, file_id: str, path_cache: Optional[Dict[str, str]] 
     if file_id in path_cache:
         return path_cache[file_id]
     
+    # Validate file_id
+    if not file_id or not isinstance(file_id, str):
+        console.print(f"[dim]Warning: Invalid file ID: {file_id}[/dim]")
+        return "/Unknown"
+    
     try:
-        # Get file metadata including parents
-        file_metadata = service.files().get(
-            fileId=file_id, 
+        # Get file metadata including parents with retry logic
+        file_metadata = retry_api_call(
+            service.files().get,
+            fileId=file_id,
             fields='id,name,parents'
         ).execute()
         
@@ -108,7 +214,15 @@ def get_folder_path(service, file_id: str, path_cache: Optional[Dict[str, str]] 
         return path
         
     except HttpError as error:
-        console.print(f"[dim]Warning: Could not get path for {file_id}: {error}[/dim]")
+        if error.resp.status == 404:
+            console.print(f"[dim]Warning: File not found or not accessible: {file_id}[/dim]")
+        elif error.resp.status == 403:
+            console.print(f"[dim]Warning: Access denied to file: {file_id}[/dim]")
+        else:
+            console.print(f"[dim]Warning: Could not get path for {file_id}: {error}[/dim]")
+        return "/Unknown"
+    except Exception as e:
+        console.print(f"[dim]Warning: Unexpected error getting path for {file_id}: {e}[/dim]")
         return "/Unknown"
 
 
@@ -131,6 +245,12 @@ def get_file_folder_path(service, file_data: dict, path_cache: Optional[Dict[str
 def search_files(service, extension: Optional[str] = None, min_size_mb: Optional[float] = None) -> List[dict]:
     """Search for files with specific criteria."""
     try:
+        # Validate inputs
+        if extension:
+            extension = validate_extension(extension)
+        if min_size_mb is not None:
+            min_size_mb = validate_size(min_size_mb)
+        
         # Build query for regular files (not trashed, not folders, owned by user)
         query_parts = [
             "trashed=false",
@@ -146,49 +266,84 @@ def search_files(service, extension: Optional[str] = None, min_size_mb: Optional
         
         results = []
         page_token = None
+        page_count = 0
+        max_pages = 100  # Safety limit to prevent infinite loops
         
-        while True:
-            response = service.files().list(
-                q=query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents, owners)',
-                pageToken=page_token,
-                pageSize=100
-            ).execute()
-            
-            files = response.get('files', [])
-            results.extend(files)
-            
-            page_token = response.get('nextPageToken', None)
-            if page_token is None:
-                break
+        while page_count < max_pages:
+            try:
+                response = retry_api_call(
+                    service.files().list,
+                    q=query,
+                    spaces='drive',
+                    fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents, owners)',
+                    pageToken=page_token,
+                    pageSize=100
+                )
+                
+                files = response.get('files', [])
+                if not files:
+                    break
+                
+                results.extend(files)
+                page_count += 1
+                
+                page_token = response.get('nextPageToken', None)
+                if page_token is None:
+                    break
+                    
+            except HttpError as error:
+                if error.resp.status == 400:
+                    console.print(f"[red]Invalid search query: {error}[/red]")
+                elif error.resp.status == 403:
+                    console.print(f"[red]Insufficient permissions to search files: {error}[/red]")
+                else:
+                    console.print(f"[red]Error during file search: {error}[/red]")
+                return []
+        
+        if page_count >= max_pages:
+            console.print(f"[yellow]Warning: Search limited to {max_pages} pages. Some results may be missing.[/yellow]")
         
         # Post-process filters
         filtered_results = []
         
         for f in results:
-            # Exact extension match
-            if extension and not f.get('name', '').lower().endswith(f'.{extension.lower()}'):
-                continue
-            
-            # Size filter
-            if min_size_mb is not None:
-                size_str = f.get('size')
-                if size_str:
-                    size_bytes = int(size_str)
-                    size_mb = size_bytes / (1024 * 1024)
-                    if size_mb < min_size_mb:
-                        continue
-                else:
-                    # Skip files without size info if size filter is active
+            try:
+                # Validate file data
+                if not f.get('id') or not f.get('name'):
                     continue
-            
-            filtered_results.append(f)
+                
+                # Exact extension match
+                if extension and not f.get('name', '').lower().endswith(f'.{extension.lower()}'):
+                    continue
+                
+                # Size filter
+                if min_size_mb is not None:
+                    size_str = f.get('size')
+                    if size_str:
+                        try:
+                            size_bytes = int(size_str)
+                            size_mb = size_bytes / (1024 * 1024)
+                            if size_mb < min_size_mb:
+                                continue
+                        except (ValueError, TypeError):
+                            # Skip files with invalid size data
+                            continue
+                    else:
+                        # Skip files without size info if size filter is active
+                        continue
+                
+                filtered_results.append(f)
+            except Exception as e:
+                console.print(f"[dim]Warning: Error processing file {f.get('name', 'unknown')}: {e}[/dim]")
+                continue
         
         return filtered_results
         
-    except HttpError as error:
-        console.print(f"[red]An error occurred while searching: {error}[/red]")
+    except ValueError as e:
+        console.print(f"[red]Invalid input: {e}[/red]")
+        return []
+    except Exception as e:
+        console.print(f"[red]Unexpected error during file search: {e}[/red]")
         return []
 
 
@@ -197,12 +352,18 @@ def format_size(size_str: str) -> str:
     if not size_str:
         return "Unknown"
     
-    size = int(size_str)
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
+    try:
+        size = int(size_str)
+        if size < 0:
+            return "Unknown"
+        
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} PB"
+    except (ValueError, TypeError):
+        return "Unknown"
 
 
 def display_files(service, files: List[dict], extension: Optional[str] = None, min_size_mb: Optional[float] = None):
@@ -243,7 +404,10 @@ def display_files(service, files: List[dict], extension: Optional[str] = None, m
             size_str = file.get('size', '0')
             size = format_size(size_str)
             if size_str:
-                total_size += int(size_str)
+                try:
+                    total_size += int(size_str)
+                except (ValueError, TypeError):
+                    pass  # Skip invalid sizes in total calculation
             
             # Get folder path
             folder_path = get_file_folder_path(service, file, path_cache)
@@ -254,8 +418,9 @@ def display_files(service, files: List[dict], extension: Optional[str] = None, m
                 try:
                     dt = date_parser.parse(file_date)
                     file_date = dt.strftime('%Y-%m-%d %H:%M:%S')
-                except:
-                    pass
+                except (ValueError, TypeError, AttributeError) as e:
+                    console.print(f"[dim]Warning: Invalid date format for {name}: {e}[/dim]")
+                    file_date = 'Unknown'
             
             table.add_row(name, size, folder_path, file_date)
     
@@ -267,49 +432,90 @@ def display_files(service, files: List[dict], extension: Optional[str] = None, m
 def delete_files(service, files: List[dict], force: bool = False, move_to_trash: bool = True):
     """Delete or trash files from Drive."""
     if not files:
+        console.print("[yellow]No files to delete.[/yellow]")
+        return
+    
+    # Validate files list
+    valid_files = []
+    for file in files:
+        if not file.get('id') or not file.get('name'):
+            console.print(f"[red]Skipping invalid file: {file}[/red]")
+            continue
+        valid_files.append(file)
+    
+    if not valid_files:
+        console.print("[red]No valid files to delete.[/red]")
         return
     
     action = "move to trash" if move_to_trash else "permanently delete"
     
     if not force:
-        console.print(f"\n[bold red]Warning:[/bold red] This will {action} {len(files)} file(s)!")
+        console.print(f"\n[bold red]Warning:[/bold red] This will {action} {len(valid_files)} file(s)!")
         if not move_to_trash:
-            console.print("Permanently deleted files cannot be recovered!")
+            console.print("[bold red]Permanently deleted files cannot be recovered![/bold red]")
         
-        if not Confirm.ask("Are you sure you want to continue?"):
-            console.print("[yellow]Operation cancelled.[/yellow]")
+        try:
+            if not Confirm.ask("Are you sure you want to continue?"):
+                console.print("[yellow]Operation cancelled.[/yellow]")
+                return
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Operation cancelled by user.[/yellow]")
             return
     
     deleted_count = 0
     failed_count = 0
+    failed_files = []
     
     action_verb = "Trashing" if move_to_trash else "Deleting"
     
     with console.status(f"[bold green]{action_verb} files...", spinner="dots") as status:
-        for file in files:
+        for i, file in enumerate(valid_files, 1):
             file_name = file.get('name', 'Unknown')
             file_id = file.get('id')
             
-            if not file_id:
-                console.print(f"[red]Skipping {file_name}: No file ID[/red]")
-                failed_count += 1
-                continue
-            
             try:
                 if move_to_trash:
-                    service.files().update(fileId=file_id, body={'trashed': True}).execute()
+                    retry_api_call(
+                        service.files().update,
+                        fileId=file_id,
+                        body={'trashed': True}
+                    )
                 else:
-                    service.files().delete(fileId=file_id).execute()
+                    retry_api_call(
+                        service.files().delete,
+                        fileId=file_id
+                    )
                 deleted_count += 1
-                status.update(f"[bold green]{action_verb.replace('ing', 'ed')} {deleted_count}/{len(files)} files...")
+                status.update(f"[bold green]{action_verb.replace('ing', 'ed')} {deleted_count}/{len(valid_files)} files...")
+                
             except HttpError as error:
-                console.print(f"[red]Failed to {action} {file_name}: {error}[/red]")
+                error_msg = f"Failed to {action} {file_name}"
+                if error.resp.status == 404:
+                    error_msg += ": File not found or already deleted"
+                elif error.resp.status == 403:
+                    error_msg += ": Access denied or insufficient permissions"
+                elif error.resp.status == 400:
+                    error_msg += ": Invalid request"
+                else:
+                    error_msg += f": {error}"
+                
+                console.print(f"[red]{error_msg}[/red]")
                 failed_count += 1
+                failed_files.append(file_name)
+                
+            except Exception as error:
+                console.print(f"[red]Unexpected error deleting {file_name}: {error}[/red]")
+                failed_count += 1
+                failed_files.append(file_name)
     
+    # Summary
     verb = "moved to trash" if move_to_trash else "permanently deleted"
     console.print(f"\n[green]Successfully {verb} {deleted_count} file(s)[/green]")
+    
     if failed_count > 0:
         console.print(f"[red]Failed to {action} {failed_count} file(s)[/red]")
+        if failed_files:
+            console.print(f"[dim]Failed files: {', '.join(failed_files[:5])}{'...' if len(failed_files) > 5 else ''}[/dim]")
 
 
 @click.group()
@@ -333,7 +539,20 @@ def list(extension: str, size: float, output_json: bool):
         console.print("  gdrive-eraser list mp4 --size 500         # List MP4 files >500MB")
         return
     
-    service = authenticate()
+    # Validate inputs
+    try:
+        if extension:
+            extension = validate_extension(extension)
+        if size is not None:
+            size = validate_size(size)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        return
+    
+    try:
+        service = authenticate()
+    except SystemExit:
+        return  # Authentication failed, error already printed
     
     filters = []
     if extension:
@@ -352,11 +571,19 @@ def list(extension: str, size: float, output_json: bool):
         for file in files:
             file['folder_path'] = get_file_folder_path(service, file, path_cache)
         
+        total_size_bytes = 0
+        for f in files:
+            if f.get('size'):
+                try:
+                    total_size_bytes += int(f.get('size', 0))
+                except (ValueError, TypeError):
+                    pass
+        
         output = {
             'extension': extension,
             'min_size_mb': size,
             'count': len(files),
-            'total_size_bytes': sum(int(f.get('size', 0)) for f in files if f.get('size')),
+            'total_size_bytes': total_size_bytes,
             'files': files
         }
         print(json.dumps(output, indent=2))
@@ -381,7 +608,32 @@ def delete(extension: str, size: float, force: bool, dry_run: bool, permanent: b
         console.print("  gdrive-eraser delete --size 1000 --dry-run # Preview large files")
         return
     
-    service = authenticate()
+    # Validate inputs
+    try:
+        if extension:
+            extension = validate_extension(extension)
+        if size is not None:
+            size = validate_size(size)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        return
+    
+    # Safety check for permanent deletion
+    if permanent and not dry_run and not force:
+        console.print("[red]WARNING: Permanent deletion is destructive and cannot be undone![/red]")
+        console.print("[yellow]Consider using --dry-run first to preview what will be deleted.[/yellow]")
+        try:
+            if not Confirm.ask("Are you absolutely sure you want to permanently delete files?"):
+                console.print("[yellow]Operation cancelled.[/yellow]")
+                return
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Operation cancelled by user.[/yellow]")
+            return
+    
+    try:
+        service = authenticate()
+    except SystemExit:
+        return  # Authentication failed, error already printed
     
     filters = []
     if extension:
