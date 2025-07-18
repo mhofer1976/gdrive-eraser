@@ -8,7 +8,8 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any, Union, Callable
+from googleapiclient.discovery import Resource
 import json
 import click
 
@@ -30,11 +31,11 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 console = Console()
 
 
-def retry_api_call(func, *args, max_retries=3, backoff_factor=1.0, **kwargs):
+def retry_api_call(func: Callable[..., Any], *args: Any, max_retries: int = 3, backoff_factor: float = 1.0, **kwargs: Any) -> Optional[Dict[str, Any]]:
     """Retry API calls with exponential backoff for transient errors."""
     for attempt in range(max_retries):
         try:
-            return func(*args, **kwargs)
+            return func(*args, **kwargs).execute()
         except HttpError as e:
             if e.resp.status in [429, 500, 502, 503, 504]:  # Retryable errors
                 if attempt < max_retries - 1:
@@ -71,7 +72,7 @@ def validate_extension(extension: str) -> str:
     return extension
 
 
-def validate_size(size: float) -> float:
+def validate_size(size: Optional[float]) -> Optional[float]:
     """Validate file size parameter."""
     if size is None:
         return size
@@ -85,7 +86,7 @@ def validate_size(size: float) -> float:
     return size
 
 
-def authenticate():
+def authenticate() -> Resource:
     """Authenticate and return Google Drive service instance."""
     creds = None
     token_path = Path('token.json')
@@ -170,7 +171,7 @@ def authenticate():
         sys.exit(1)
 
 
-def get_folder_path(service, file_id: str, path_cache: Optional[Dict[str, str]] = None) -> str:
+def get_folder_path(service: Resource, file_id: str, path_cache: Optional[Dict[str, str]] = None) -> str:
     """Get the full folder path for a file or folder."""
     if path_cache is None:
         path_cache = {}
@@ -190,7 +191,11 @@ def get_folder_path(service, file_id: str, path_cache: Optional[Dict[str, str]] 
             service.files().get,
             fileId=file_id,
             fields='id,name,parents'
-        ).execute()
+        )
+        
+        if file_metadata is None:
+            console.print(f"[dim]Warning: Could not get metadata for {file_id} after retries[/dim]")
+            return "/Unknown"
         
         file_name = file_metadata.get('name', 'Unknown')
         parents = file_metadata.get('parents', [])
@@ -226,7 +231,7 @@ def get_folder_path(service, file_id: str, path_cache: Optional[Dict[str, str]] 
         return "/Unknown"
 
 
-def get_file_folder_path(service, file_data: dict, path_cache: Optional[Dict[str, str]] = None) -> str:
+def get_file_folder_path(service: Resource, file_data: Dict[str, Any], path_cache: Optional[Dict[str, str]] = None) -> str:
     """Get the folder path where a file is located (not including the file itself)."""
     if path_cache is None:
         path_cache = {}
@@ -242,7 +247,7 @@ def get_file_folder_path(service, file_data: dict, path_cache: Optional[Dict[str
     return parent_path if parent_path else "/"
 
 
-def search_files(service, extension: Optional[str] = None, min_size_mb: Optional[float] = None) -> List[dict]:
+def search_files(service: Resource, extension: Optional[str] = None, min_size_mb: Optional[float] = None) -> List[Dict[str, Any]]:
     """Search for files with specific criteria."""
     try:
         # Validate inputs
@@ -279,6 +284,10 @@ def search_files(service, extension: Optional[str] = None, min_size_mb: Optional
                     pageToken=page_token,
                     pageSize=100
                 )
+                
+                if response is None:
+                    console.print("[red]Error: API call failed after retries[/red]")
+                    break
                 
                 files = response.get('files', [])
                 if not files:
@@ -366,7 +375,7 @@ def format_size(size_str: str) -> str:
         return "Unknown"
 
 
-def display_files(service, files: List[dict], extension: Optional[str] = None, min_size_mb: Optional[float] = None):
+def display_files(service: Resource, files: List[Dict[str, Any]], extension: Optional[str] = None, min_size_mb: Optional[float] = None) -> None:
     """Display files in a formatted table."""
     if not files:
         filters = []
@@ -429,7 +438,7 @@ def display_files(service, files: List[dict], extension: Optional[str] = None, m
     console.print(f"[bold]Total size:[/bold] {format_size(str(total_size))}")
 
 
-def delete_files(service, files: List[dict], force: bool = False, move_to_trash: bool = True):
+def delete_files(service: Resource, files: List[Dict[str, Any]], force: bool = False, move_to_trash: bool = True) -> None:
     """Delete or trash files from Drive."""
     if not files:
         console.print("[yellow]No files to delete.[/yellow]")
@@ -519,7 +528,7 @@ def delete_files(service, files: List[dict], force: bool = False, move_to_trash:
 
 
 @click.group()
-@click.version_option(version='1.0.2', prog_name='gdrive-file-eraser')
+@click.version_option(version='1.0.4', prog_name='gdrive-file-eraser')
 def cli():
     """GDrive File Eraser - Find and delete large files from Google Drive by extension and size."""
     pass
@@ -529,7 +538,7 @@ def cli():
 @click.argument('extension', required=False)
 @click.option('--size', '-s', type=float, help='Minimum file size in MB (e.g., 100 for files >100MB)')
 @click.option('--json', 'output_json', is_flag=True, help='Output results as JSON for scripting')
-def list(extension: str, size: float, output_json: bool):
+def list(extension: Optional[str] = None, size: Optional[float] = None, output_json: bool = False) -> None:
     """List files with optional extension and size filters."""
     if not extension and size is None:
         console.print("[red]Error: You must specify either an extension or a size filter.[/red]")
@@ -597,7 +606,7 @@ def list(extension: str, size: float, output_json: bool):
 @click.option('--force', '-f', is_flag=True, help='Skip confirmation prompt')
 @click.option('--dry-run', is_flag=True, help='Show what would be deleted without deleting')
 @click.option('--permanent', is_flag=True, help='Permanently delete files (default: move to trash)')
-def delete(extension: str, size: float, force: bool, dry_run: bool, permanent: bool):
+def delete(extension: Optional[str] = None, size: Optional[float] = None, force: bool = False, dry_run: bool = False, permanent: bool = False) -> None:
     """Delete files with optional extension and size filters."""
     if not extension and size is None:
         console.print("[red]Error: You must specify either an extension or a size filter.[/red]")
@@ -647,7 +656,7 @@ def delete(extension: str, size: float, force: bool, dry_run: bool, permanent: b
     files = search_files(service, extension, size)
     
     if not files:
-        console.print(f"[yellow]No files matching criteria found in your Google Drive.[/yellow]")
+        console.print("[yellow]No files matching criteria found in your Google Drive.[/yellow]")
         return
     
     move_to_trash = not permanent
@@ -663,7 +672,7 @@ def delete(extension: str, size: float, force: bool, dry_run: bool, permanent: b
 
 
 @cli.command()
-def setup():
+def setup() -> None:
     """Interactive setup guide for Google Drive API credentials."""
     console.print("[bold]🚀 GDrive File Eraser Setup[/bold]\n")
     
